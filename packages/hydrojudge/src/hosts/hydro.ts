@@ -10,6 +10,7 @@ import * as sysinfo from '@hydrooj/utils/lib/sysinfo';
 import type { JudgeResultBody } from 'hydrooj';
 import { getConfig } from '../config';
 import { FormatError, SystemError } from '../error';
+import { Session } from '../interface';
 import log from '../log';
 import { JudgeTask } from '../task';
 import { Lock } from '../utils';
@@ -18,7 +19,7 @@ function removeNixPath(text: string) {
     return text.replace(/\/nix\/store\/[a-z0-9]{32}-/g, '/nix/');
 }
 
-export default class Hydro {
+export default class Hydro implements Session {
     ws: WebSocket;
     language: Record<string, LangConfig>;
 
@@ -134,6 +135,10 @@ export default class Hydro {
         return target;
     }
 
+    async postFile(target: string, file: string) {
+        await this.post('judge/upload', { target }).attach('file', fs.createReadStream(file));
+    }
+
     getLang(name: string, doThrow = true) {
         if (this.language[name]) return this.language[name];
         if (name === 'cpp' && this.language.cc) return this.language.cc;
@@ -178,8 +183,12 @@ export default class Hydro {
                 Authorization: `Bearer ${this.config.cookie.split('sid=')[1].split(';')[0]}`,
             },
         });
-        const content = this.config.minPriority !== undefined
-            ? `{"key":"prio","prio":${this.config.minPriority}}`
+        const config: { prio?: number, concurrency?: number, lang?: string[] } = {};
+        if (this.config.minPriority !== undefined) config.prio = this.config.minPriority;
+        if (this.config.concurrency !== undefined) config.concurrency = this.config.concurrency;
+        if (this.config.lang?.length) config.lang = this.config.lang;
+        const content = Object.keys(config).length
+            ? JSON.stringify({ key: 'config', ...config })
             : '{"key":"ping"}';
         setInterval(() => this.ws?.send?.(content), 30000);
         this.ws.on('message', (data) => {
@@ -224,7 +233,8 @@ export default class Hydro {
         const res = await this.post('login', {
             uname: this.config.uname, password: this.config.password, rememberme: 'on',
         });
-        await this.setCookie(res.headers['set-cookie'].join(';'));
+        const setCookie = res.headers['set-cookie'];
+        await this.setCookie(Array.isArray(setCookie) ? setCookie.join(';') : setCookie);
     }
 
     async ensureLogin() {

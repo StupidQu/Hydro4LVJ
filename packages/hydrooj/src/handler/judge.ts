@@ -1,20 +1,27 @@
 import assert from 'assert';
+import fs from 'fs-extra';
 import yaml from 'js-yaml';
 import { omit } from 'lodash';
 import { ObjectId } from 'mongodb';
+import sanitize from 'sanitize-filename';
 import {
-    JudgeResultBody, ProblemConfigFile, RecordDoc, TestCase,
+    FileLimitExceededError, ForbiddenError, ProblemIsReferencedError, ValidationError,
+} from '../error';
+import {
+    JudgeResultBody, ProblemConfigFile, RecordDoc, Task, TestCase,
 } from '../interface';
 import { Logger } from '../logger';
 import * as builtin from '../model/builtin';
-import { STATUS } from '../model/builtin';
+import { PERM, STATUS } from '../model/builtin';
 import * as contest from '../model/contest';
 import domain from '../model/domain';
 import problem from '../model/problem';
 import record from '../model/record';
 import * as setting from '../model/setting';
 import storage from '../model/storage';
+import * as system from '../model/system';
 import task from '../model/task';
+import user from '../model/user';
 import * as bus from '../service/bus';
 import { updateJudge } from '../service/monitor';
 import {
@@ -63,13 +70,19 @@ function processPayload(rdoc: RecordDoc, body: Partial<JudgeResultBody>) {
     return { $set, $push };
 }
 
-export async function next(body: Partial<JudgeResultBody>) {
+export async function next(body: Partial<JudgeResultBody> & { rdoc: RecordDoc }) {
     body.rid = new ObjectId(body.rid);
-    let rdoc = await record.get(body.rid);
-    if (!rdoc) return;
+    let rdoc = body.rdoc;
+    if (!rdoc) {
+        logger.warn('Next function without rdoc is deprecated.');
+        console.trace();
+        rdoc = await record.get(body.rid);
+        if (!rdoc) return null;
+    }
     const { $set, $push } = processPayload(rdoc, body);
     rdoc = await record.update(rdoc.domainId, body.rid, $set, $push, {}, body.addProgress ? { progress: body.addProgress } : {});
-    bus.broadcast('record/change', rdoc!, $set, $push, body);
+    bus.broadcast('record/change', rdoc, $set, $push, body);
+    return rdoc;
 }
 
 export async function postJudge(rdoc: RecordDoc) {
@@ -120,7 +133,11 @@ export async function postJudge(rdoc: RecordDoc) {
                 await record.judge(rdoc.domainId, rdocs.map((r) => r._id), priority, {}, { hackRejudge: input });
             } catch (e) {
                 next({
-                    rid: rdoc._id, domainId: rdoc.domainId, key: 'next', message: { message: 'Unable to apply hack: {0}', params: [e.message] },
+                    rid: rdoc._id,
+                    domainId: rdoc.domainId,
+                    key: 'next',
+                    message: { message: 'Unable to apply hack: {0}', params: [e.message] },
+                    rdoc,
                 });
             }
         }
@@ -128,10 +145,15 @@ export async function postJudge(rdoc: RecordDoc) {
     await bus.parallel('record/judge', rdoc, updated);
 }
 
-export async function end(body: Partial<JudgeResultBody>) {
-    body.rid &&= new ObjectId(body.rid);
-    let rdoc = await record.get(body.rid);
-    if (!rdoc) return;
+export async function end(body: Partial<JudgeResultBody> & { rdoc: RecordDoc }) {
+    body.rid = new ObjectId(body.rid);
+    let rdoc = body.rdoc;
+    if (!rdoc) {
+        logger.warn('End function without rdoc is deprecated.');
+        console.trace();
+        rdoc = await record.get(body.rid);
+        if (!rdoc) return null;
+    }
     const { $set, $push } = processPayload(rdoc, body);
     const $unset: any = { progress: '' };
     $set.judgeAt = new Date();
@@ -141,6 +163,7 @@ export async function end(body: Partial<JudgeResultBody>) {
     await postJudge(rdoc);
     rdoc = await record.get(body.rid);
     bus.broadcast('record/change', rdoc, null, null, body); // trigger a full update
+    return rdoc;
 }
 
 export class JudgeFilesDownloadHandler extends Handler {
@@ -173,12 +196,49 @@ export class SubmissionDataDownloadHandler extends Handler {
     }
 }
 
+export async function processJudgeFileCallback(rid: ObjectId, filename: string, filePath: string) {
+    const rdoc = await record.get(rid);
+    const [pdoc, udoc] = await Promise.all([
+        problem.get(rdoc.domainId, rdoc.pid),
+        user.getById(rdoc.domainId, rdoc.uid),
+    ]);
+    if (!udoc.own(pdoc, PERM.PERM_EDIT_PROBLEM_SELF) && !udoc.hasPerm(PERM.PERM_EDIT_PROBLEM)) throw new ForbiddenError();
+    if (pdoc.reference) throw new ProblemIsReferencedError('edit files');
+    const stat = await fs.stat(filePath);
+    if ((pdoc.data?.length || 0)
+        + (pdoc.additional_file?.length || 0)
+        >= system.get('limit.problem_files_max')) {
+        throw new FileLimitExceededError('count');
+    }
+    const size = Math.sum(
+        (pdoc.data || []).map((i) => i.size),
+        (pdoc.additional_file || []).map((i) => i.size),
+        stat.size,
+    );
+    if (size >= system.get('limit.problem_files_max_size')) {
+        throw new FileLimitExceededError('size');
+    }
+    await problem.addTestdata(pdoc.domainId, pdoc.docId, sanitize(filename), fs.createReadStream(filePath), udoc._id);
+}
+
+export class JudgeFileUpdateHandler extends Handler {
+    @post('rid', Types.ObjectId)
+    @post('name', Types.Filename)
+    async post(domainId: string, rid: ObjectId, filename: string) {
+        if (!this.request.files.file) throw new ValidationError('file');
+        await processJudgeFileCallback(rid, filename, this.request.files.file.filepath);
+        this.response.body = { ok: 1 };
+    }
+}
+
 class JudgeConnectionHandler extends ConnectionHandler {
     category = '#judge';
-    processing: any = null;
+    processing: Task[] = [];
     closed = false;
-    query: any = { type: 'judge' };
+    query: any = { type: { $in: ['judge', 'generate'] } };
+    rdocs: Record<string, RecordDoc> = {};
     ip: string;
+    concurrency = 1;
 
     async prepare() {
         logger.info('Judge daemon connected from ', this.request.ip);
@@ -194,7 +254,7 @@ class JudgeConnectionHandler extends ConnectionHandler {
     }
 
     async newTask() {
-        if (this.processing) return;
+        if (this.processing.length >= this.concurrency) return;
         let t;
         let rdoc: RecordDoc;
         while (!t) {
@@ -207,7 +267,8 @@ class JudgeConnectionHandler extends ConnectionHandler {
             if (!rdoc) t = null;
         }
         this.send({ task: { ...rdoc, ...t } });
-        this.processing = t;
+        this.rdocs[rdoc._id.toHexString()] = rdoc;
+        this.processing.push(t);
         const $set = { status: builtin.STATUS.STATUS_FETCHED };
         rdoc = await record.update(t.domainId, t.rid, $set, {});
         bus.broadcast('record/change', rdoc, $set, {});
@@ -219,30 +280,52 @@ class JudgeConnectionHandler extends ConnectionHandler {
             const keys = method === 'debug' ? ['key'] : ['key', 'subtasks', 'cases'];
             logger[method]('%o', omit(msg, keys));
         }
-        if (msg.key === 'next') await next(msg);
-        else if (msg.key === 'end') {
-            if (!msg.nop) await end({ judger: this.user._id, ...msg }).catch((e) => logger.error(e));
-            this.processing = null;
-            await this.newTask();
+        if (['next', 'end'].includes(msg.key)) {
+            const rdoc = this.rdocs[msg.rid];
+            if (!rdoc) return;
+            if (msg.key === 'next') await next({ ...msg, rdoc });
+            if (msg.key === 'end') {
+                if (!msg.nop) await end({ judger: this.user._id, ...msg, rdoc }).catch((e) => logger.error(e));
+                this.processing = this.processing.filter((t) => t.rid.toHexString() !== msg.rid);
+                delete this.rdocs[msg.rid];
+                await this.newTask();
+            }
         } else if (msg.key === 'status') {
             await updateJudge(msg.info);
-        } else if (msg.key === 'prio') {
+        } else if (msg.key === 'prio' && typeof msg.prio === 'number') {
             this.query.priority = { $gt: msg.prio };
+        } else if (msg.key === 'config') {
+            if (Number.isSafeInteger(msg.prio)) {
+                this.query.priority = { $gt: msg.prio };
+            }
+            if (Number.isSafeInteger(msg.concurrency) && msg.concurrency > 0) {
+                const old = this.concurrency;
+                this.concurrency = msg.concurrency;
+                if (old <= this.concurrency) {
+                    for (let i = old; i < this.concurrency; i++) {
+                        await this.newTask(); // eslint-disable-line no-await-in-loop
+                    }
+                }
+            }
+            if (msg.lang instanceof Array && msg.lang.every((i) => typeof i === 'string')) {
+                this.query.lang = { $in: msg.lang };
+            }
         }
     }
 
     async cleanup() {
-        logger.info('Judge daemon disconnected from ', this.request.ip);
-        if (this.processing) {
-            await record.reset(this.processing.domainId, this.processing.rid, false);
-            await task.add(this.processing);
-        }
         this.closed = true;
+        logger.info('Judge daemon disconnected from ', this.request.ip);
+        await Promise.all(this.processing.map(async (t) => {
+            await record.reset(t.domainId, t.rid, false);
+            return await task.add(t);
+        }));
     }
 }
 
 export async function apply(ctx) {
     ctx.Route('judge_files_download', '/judge/files', JudgeFilesDownloadHandler, builtin.PRIV.PRIV_JUDGE);
+    ctx.Route('judge_files_upload', '/judge/upload', JudgeFileUpdateHandler, builtin.PRIV.PRIV_JUDGE);
     ctx.Route('judge_submission_download', '/judge/code', SubmissionDataDownloadHandler, builtin.PRIV.PRIV_JUDGE);
     ctx.Connection('judge_conn', '/judge/conn', JudgeConnectionHandler, builtin.PRIV.PRIV_JUDGE);
 }
