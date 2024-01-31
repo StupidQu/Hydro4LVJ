@@ -1,0 +1,6 @@
+{
+  "name": "@hydrooj/vjudge-ex",
+  "author": "StupidQu",
+  "license": "AGPL-3.0-or-later",
+  "packageManager": "yarn@4.0.2"
+}
