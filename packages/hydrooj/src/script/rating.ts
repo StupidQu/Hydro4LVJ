@@ -41,7 +41,7 @@ export const RpTypes: Record<string, RpDef> = {
                         score: { $gt: 0 },
                     },
                 );
-                const difficulty = +pdoc.difficulty || difficultyAlgorithm(pdoc.nSubmit, pdoc.nAccept) || 5;
+                const difficulty = Math.floor(Math.pow(1.8, +pdoc.difficulty || 1));
                 const p = difficulty / 100;
                 let psdoc;
                 while (psdoc = await cursor.next()) {
